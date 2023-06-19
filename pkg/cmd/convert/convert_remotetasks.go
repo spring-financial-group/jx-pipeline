@@ -106,16 +106,32 @@ func (o *RemoteTasksOptions) Run() error {
 		return errors.Wrapf(err, "failed to validate options")
 	}
 
-	err := filepath.Walk(o.Dir, func(path string, info os.FileInfo, err error) error {
+	// We need to make sure that the tasks directory is processed first, then the packs directory as the packs directory
+	// will reference tasks in the tasks directory
+	fs, err := os.ReadDir(o.Dir)
+	if err != nil {
+		return errors.Wrapf(err, "failed to read dir %s", o.Dir)
+	}
+
+	for _, f := range o.sortDirs(fs) {
+		if !f.IsDir() {
+			continue
+		}
+
+		err = filepath.Walk(f.Name(), func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if info == nil || !info.IsDir() {
+				return nil
+			}
+			return o.ProcessDir(path)
+		})
 		if err != nil {
-			return err
+			log.Logger().Errorf("failed to process dir %s: %s", f.Name(), err.Error())
 		}
-		if info == nil || !info.IsDir() {
-			return nil
-		}
-		return o.ProcessDir(path)
-	})
-	return err
+	}
+	return nil
 }
 
 func (o *RemoteTasksOptions) ProcessDir(dir string) error {
@@ -136,6 +152,23 @@ func (o *RemoteTasksOptions) ProcessDir(dir string) error {
 		}
 	}
 	return nil
+}
+
+// sortDirs sorts the directories so that the tasks and packs directories are processed first
+func (o *RemoteTasksOptions) sortDirs(dirs []os.DirEntry) []os.DirEntry {
+	dirs = o.moveDirEntryInSliceToIndex(dirs, "tasks", 0)
+	dirs = o.moveDirEntryInSliceToIndex(dirs, "packs", 1)
+	return dirs
+}
+func (o *RemoteTasksOptions) moveDirEntryInSliceToIndex(slice []os.DirEntry, name string, index int) []os.DirEntry {
+	for i, dir := range slice {
+		if dir.Name() == name {
+			slice = append(slice[:i], slice[i+1:]...)
+			slice = append(slice[:index], append([]os.DirEntry{dir}, slice[index:]...)...)
+			break
+		}
+	}
+	return slice
 }
 
 func (o *RemoteTasksOptions) getWorkspaceQuantity() (resource.Quantity, error) {
