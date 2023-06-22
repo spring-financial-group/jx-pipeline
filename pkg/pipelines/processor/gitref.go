@@ -9,12 +9,14 @@ import (
 
 // GitRef is a representation of the Tekton git resolver params
 type GitRef struct {
-	URL        string
-	Org        string
-	Repository string
-	Revision   string
-	PathInRepo string
-	IsPublic   bool
+	URL          string
+	Org          string
+	Repository   string
+	Revision     string
+	PathInRepo   string
+	StepName     string
+	IsPublic     bool
+	ResolvedFile []byte
 }
 
 // GetParentFileName returns the filename of the parent pipeline run

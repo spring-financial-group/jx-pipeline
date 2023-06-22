@@ -178,6 +178,9 @@ func TestRemoteTasksMigrator_ProcessPipelineRun_ChildPipelineRun(t *testing.T) {
 	assert.NoError(t, err)
 	assert.True(t, isModified)
 
+	err = yamls.SaveFile(prs, newPrsPath)
+	assert.NoError(t, err)
+
 	var expected *v1beta1.PipelineRun
 	err = yamls.LoadFile(expectedPRSPath, &expected)
 	assert.NoError(t, err)

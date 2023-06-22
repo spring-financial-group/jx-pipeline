@@ -1,6 +1,14 @@
 package convert
 
 import (
+	"github.com/jenkins-x-plugins/jx-gitops/pkg/apis/gitops/v1alpha1"
+	"github.com/jenkins-x-plugins/jx-gitops/pkg/pipelinecatalogs"
+	v1 "github.com/jenkins-x/jx-api/v4/pkg/apis/jenkins.io/v1"
+	"github.com/jenkins-x/jx-api/v4/pkg/client/clientset/versioned"
+	"github.com/jenkins-x/jx-helpers/v3/pkg/kube"
+	"github.com/jenkins-x/jx-helpers/v3/pkg/kube/jxclient"
+	"github.com/jenkins-x/jx-helpers/v3/pkg/kube/jxenv"
+	"k8s.io/client-go/kubernetes"
 	"os"
 	"path/filepath"
 
@@ -21,14 +29,20 @@ import (
 type RemoteTasksOptions struct {
 	options.BaseOptions
 
+	DevEnv                       *v1.Environment
+	Namespace                    string
 	OverrideSHA                  string
 	Dir                          string
 	WorkspaceVolumeSize          string
 	CalculateWorkspaceVolumeSize bool
 
-	Processor     processor.Interface
-	GitClient     gitclient.Interface
-	CommandRunner cmdrunner.CommandRunner
+	Processor      processor.Interface
+	GitClient      gitclient.Interface
+	CommandRunner  cmdrunner.CommandRunner
+	GitRefResolver *processor.GitRefResolver
+
+	KubeClient kubernetes.Interface
+	JXClient   versioned.Interface
 }
 
 var (
@@ -82,9 +96,29 @@ func (o *RemoteTasksOptions) Validate() error {
 		return errors.Wrapf(err, "failed to validate base options")
 	}
 
+	o.KubeClient, o.Namespace, err = kube.LazyCreateKubeClientAndNamespace(o.KubeClient, o.Namespace)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create the kube client")
+	}
+	o.JXClient, err = jxclient.LazyCreateJXClient(o.JXClient)
+	if err != nil {
+		return errors.Wrapf(err, "failed to create the jx client")
+	}
 	if o.CommandRunner == nil {
 		o.CommandRunner = cmdrunner.QuietCommandRunner
 	}
+
+	if o.DevEnv == nil {
+		o.DevEnv, err = jxenv.GetDevEnvironment(o.JXClient, o.Namespace)
+		if err != nil {
+			return errors.Wrapf(err, "failed to find the dev Environment")
+		}
+		if o.DevEnv == nil {
+			return errors.Errorf("could not find the dev Environment in the namespace %s: "+
+				"Please run 'jx ns jx' to switch to the development namespace and retry this command", o.Namespace)
+		}
+	}
+
 	if o.GitClient == nil {
 		o.GitClient = cli.NewCLIClient("", o.CommandRunner)
 	}
@@ -94,8 +128,17 @@ func (o *RemoteTasksOptions) Validate() error {
 		return errors.Wrapf(err, "failed to get workspace quantity")
 	}
 
+	catalogs, err := o.getPipelineCatalogs()
+	if err != nil {
+		return errors.Wrapf(err, "failed to get pipeline catalog")
+	}
+
+	if o.GitRefResolver == nil {
+		o.GitRefResolver = processor.NewGitRefResolver(o.OverrideSHA, catalogs)
+	}
+
 	if o.Processor == nil {
-		o.Processor = processor.NewRemoteTasksMigrator(o.OverrideSHA, workspaceQuantity)
+		o.Processor = processor.NewRemoteTasksMigrator(workspaceQuantity, o.GitRefResolver)
 	}
 	return nil
 }
@@ -113,6 +156,7 @@ func (o *RemoteTasksOptions) Run() error {
 		return errors.Wrapf(err, "failed to read dir %s", o.Dir)
 	}
 
+	var errCount int
 	for _, f := range o.sortDirs(fs) {
 		if !f.IsDir() {
 			continue
@@ -129,9 +173,32 @@ func (o *RemoteTasksOptions) Run() error {
 		})
 		if err != nil {
 			log.Logger().Errorf("failed to process dir %s: %s", f.Name(), err.Error())
+			errCount++
 		}
 	}
+	if errCount > 0 {
+		return errors.Errorf("failed to process %d directories", errCount)
+	}
 	return nil
+}
+
+func (o *RemoteTasksOptions) getPipelineCatalogs() ([]v1alpha1.PipelineCatalogSource, error) {
+	tmpDir, err := os.MkdirTemp("", "jx-pipeline")
+	if err != nil {
+		return nil, err
+	}
+
+	devRepoDir, err := gitclient.CloneToDir(o.GitClient, o.DevEnv.Spec.Source.URL, tmpDir)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to clone dev repo %s to %s", o.DevEnv.Spec.Source.URL, tmpDir)
+	}
+	defer os.RemoveAll(tmpDir)
+
+	catalog, _, err := pipelinecatalogs.LoadPipelineCatalogs(devRepoDir)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to load pipeline catalogs from %s", devRepoDir)
+	}
+	return catalog.Spec.Repositories, nil
 }
 
 func (o *RemoteTasksOptions) ProcessDir(dir string) error {

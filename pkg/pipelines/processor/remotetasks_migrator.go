@@ -2,16 +2,19 @@ package processor
 
 import (
 	"context"
-	"os"
-	"path/filepath"
-
 	"github.com/jenkins-x/jx-helpers/v3/pkg/yamls"
 	"github.com/jenkins-x/jx-logging/v3/pkg/log"
+	"github.com/jenkins-x/lighthouse-client/pkg/triggerconfig/inrepo"
 	"github.com/pkg/errors"
+	tekv1 "github.com/tektoncd/pipeline/pkg/apis/pipeline/v1"
 	"github.com/tektoncd/pipeline/pkg/apis/pipeline/v1beta1"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"os"
+	"path/filepath"
+	"reflect"
+	"sigs.k8s.io/yaml"
 )
 
 var (
@@ -125,10 +128,8 @@ type RemoteTasksMigrator struct {
 }
 
 // NewRemoteTasksMigrator creates a new uses migrator
-func NewRemoteTasksMigrator(overrideSHA string, workspaceVolumeQuantity resource.Quantity) *RemoteTasksMigrator {
-	return &RemoteTasksMigrator{workspaceVolumeQuantity: workspaceVolumeQuantity,
-		gitResolver: NewGitRefResolver(overrideSHA),
-	}
+func NewRemoteTasksMigrator(workspaceVolumeQuantity resource.Quantity, gitResolver *GitRefResolver) *RemoteTasksMigrator {
+	return &RemoteTasksMigrator{workspaceVolumeQuantity: workspaceVolumeQuantity, gitResolver: gitResolver}
 }
 
 func (p *RemoteTasksMigrator) ProcessPipeline(pipeline *v1beta1.Pipeline, path string) (bool, error) {
@@ -283,7 +284,6 @@ func (p *RemoteTasksMigrator) appendDefaultValues(task *v1beta1.Task) {
 	// We need to replace the HOME env if it's already present in the task as we're moving it from
 	// /tekton/home to /workspace
 	task.Spec.StepTemplate.Env = ReplaceOrAppendEnv(task.Spec.StepTemplate.Env, HomeEnv)
-
 }
 
 func (p *RemoteTasksMigrator) NewPipelineTaskFromStepAndPipelineRun(step *v1beta1.Step, prs *v1beta1.PipelineRun) (v1beta1.PipelineTask, error) {
@@ -294,7 +294,7 @@ func (p *RemoteTasksMigrator) NewPipelineTaskFromStepAndPipelineRun(step *v1beta
 
 	if stepParentRef != nil {
 		// If the step has a parent then we can just convert it to a pipeline task
-		return p.pipelineTaskFromParentRef(stepParentRef.GetParentFileName(), stepParentRef), nil
+		return p.pipelineTaskFromParentRef(step, stepParentRef.GetParentFileName(), stepParentRef)
 	}
 
 	if step.Image != "" {
@@ -308,7 +308,7 @@ func (p *RemoteTasksMigrator) NewPipelineTaskFromStepAndPipelineRun(step *v1beta
 		return v1beta1.PipelineTask{}, err
 	}
 
-	return p.pipelineTaskFromParentRef(step.Name, stepTemplateParentRef), nil
+	return p.pipelineTaskFromParentRef(step, step.Name, stepTemplateParentRef)
 }
 
 func (p *RemoteTasksMigrator) pipelineTaskFromStep(step *v1beta1.Step, prs *v1beta1.PipelineRun) (v1beta1.PipelineTask, error) {
@@ -324,16 +324,37 @@ func (p *RemoteTasksMigrator) pipelineTaskFromStep(step *v1beta1.Step, prs *v1be
 	}, nil
 }
 
-func (p *RemoteTasksMigrator) pipelineTaskFromParentRef(name string, ref *GitRef) v1beta1.PipelineTask {
-	return v1beta1.PipelineTask{
-		Name: name,
-		TaskRef: &v1beta1.TaskRef{
-			ResolverRef: ref.ToResolverRef(),
-		},
-		Workspaces: []v1beta1.WorkspacePipelineTaskBinding{
-			{Name: "output", Workspace: "pipeline-ws"},
-		},
+func (p *RemoteTasksMigrator) pipelineTaskFromParentRef(step *v1beta1.Step, name string, ref *GitRef) (v1beta1.PipelineTask, error) {
+	if step.Name == "" || !p.isStepOverriding(step) {
+		// If the child step isn't overriding the parent then we can create a resolver ref
+		return v1beta1.PipelineTask{
+			Name: name,
+			TaskRef: &v1beta1.TaskRef{
+				ResolverRef: ref.ToResolverRef(),
+			},
+			Workspaces: []v1beta1.WorkspacePipelineTaskBinding{
+				{Name: "output", Workspace: "pipeline-ws"},
+			},
+		}, nil
 	}
+
+	// Otherwise, we need create an embedded task that applies the original step modifications to the resolved task.
+	task, err := p.embeddedTaskFromGitRefAndOverrideStep(step, ref)
+	if err != nil {
+		return v1beta1.PipelineTask{}, err
+	}
+
+	return v1beta1.PipelineTask{
+		Name:     name,
+		TaskSpec: task,
+	}, nil
+}
+
+func (p *RemoteTasksMigrator) isStepOverriding(step *v1beta1.Step) bool {
+	inStep := &v1beta1.Step{}
+	ogStep := inStep.DeepCopy()
+	inrepo.OverrideStep(inStep, step)
+	return !reflect.DeepEqual(inStep, ogStep)
 }
 
 // NewTaskFromStepAndPipelineRun takes a step and a PipelineRun and creates a Task from them.
@@ -392,4 +413,69 @@ func (p *RemoteTasksMigrator) ProcessTask(task *v1beta1.Task, path string) (bool
 
 func (p *RemoteTasksMigrator) ProcessTaskRun(tr *v1beta1.TaskRun, path string) (bool, error) {
 	return false, nil
+}
+
+func (p *RemoteTasksMigrator) embeddedTaskFromGitRefAndOverrideStep(overrideStep *v1beta1.Step, gitRef *GitRef) (*v1beta1.EmbeddedTask, error) {
+	embedded := &v1beta1.EmbeddedTask{}
+	switch GetKindFromData(gitRef.ResolvedFile) {
+	case "Task":
+		task := &tekv1.Task{}
+		err := yaml.Unmarshal(gitRef.ResolvedFile, task)
+		if err != nil {
+			return nil, err
+		}
+
+		err = embedded.ConvertFrom(context.Background(), &task.Spec)
+		if err != nil {
+			return nil, err
+		}
+
+		OverrideEmbeddedTaskWithStep(embedded, overrideStep)
+
+	case "PipelineRun":
+		pipelineRun := &v1beta1.PipelineRun{}
+		err := yaml.Unmarshal(gitRef.ResolvedFile, pipelineRun)
+		if err != nil {
+			return nil, err
+		}
+
+		steps := pipelineRun.Spec.PipelineSpec.Tasks[0].TaskSpec.Steps
+		var step *v1beta1.Step
+		for _, st := range steps {
+			if st.Name == gitRef.StepName {
+				step = &st
+				break
+			}
+		}
+
+		inrepo.OverrideStep(step, overrideStep)
+
+		task, err := p.NewTaskFromStepAndPipelineRun(step, pipelineRun, true)
+		if err != nil {
+			return nil, err
+		}
+
+		embedded = &v1beta1.EmbeddedTask{
+			TaskSpec: task.Spec,
+		}
+	default:
+		return nil, errors.Errorf("unsupported kind %s", GetKindFromData(gitRef.ResolvedFile))
+	}
+
+	// We can remove the default lighthouse params etc. as the task is embedded so these will be populated by
+	// lighthouse on the fly
+	embedded.TaskSpec.StepTemplate.Env = RemoveEnvs(embedded.TaskSpec.StepTemplate.Env, LighthouseEnvs)
+	embedded.TaskSpec.StepTemplate.Env = RemoveEnvs(embedded.TaskSpec.StepTemplate.Env, []v1.EnvVar{HomeEnv})
+	embedded.TaskSpec.Params = RemoveParams(embedded.TaskSpec.Params, LighthouseTaskParams)
+	embedded.TaskSpec.StepTemplate.EnvFrom = RemoveEnvsFrom(embedded.TaskSpec.StepTemplate.EnvFrom, DefaultEnvFroms)
+
+	return embedded, nil
+}
+
+func OverrideEmbeddedTaskWithStep(embeddedTask *v1beta1.EmbeddedTask, overrideStep *v1beta1.Step) {
+	if len(embeddedTask.Steps) != 1 {
+		log.Logger().Warnf("cannot override task with step. Expected 1 step in task, found %d", len(embeddedTask.Steps))
+		return
+	}
+	inrepo.OverrideStep(&embeddedTask.Steps[0], overrideStep)
 }

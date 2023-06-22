@@ -30,19 +30,8 @@ func ProcessFile(processor Interface, path string) (bool, error) {
 
 	message := fmt.Sprintf("for file %s", path)
 
-	kindPrefix := "kind:"
-	var kind string
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		if !strings.HasPrefix(line, kindPrefix) {
-			continue
-		}
-		k := strings.TrimSpace(line[len(kindPrefix):])
-		if k != "" {
-			kind = k
-			break
-		}
-	}
+	kind := GetKindFromData(data)
+
 	modified := false
 	var resource interface{}
 
@@ -103,6 +92,23 @@ func ProcessFile(processor Interface, path string) (bool, error) {
 	return modified, nil
 }
 
+func GetKindFromData(data []byte) string {
+	kindPrefix := "kind:"
+	var kind string
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		if !strings.HasPrefix(line, kindPrefix) {
+			continue
+		}
+		k := strings.TrimSpace(line[len(kindPrefix):])
+		if k != "" {
+			kind = k
+			break
+		}
+	}
+	return kind
+}
+
 // ProcessPipelineSpec default function for processing a pipeline spec which may be nil
 func ProcessPipelineSpec(ps *tektonv1beta1.PipelineSpec, path string, fn func(ts *tektonv1beta1.TaskSpec, path, name string) (bool, error)) (bool, error) {
 	if ps == nil {
@@ -128,6 +134,16 @@ func ProcessPipelineSpec(ps *tektonv1beta1.PipelineSpec, path string, fn func(ts
 	return modified, nil
 }
 
+func RemoveParams(existing, toRemove []tektonv1beta1.ParamSpec) []tektonv1beta1.ParamSpec {
+	var answer []tektonv1beta1.ParamSpec
+	for _, param := range existing {
+		if !containsParam(toRemove, param.Name) {
+			answer = append(answer, param)
+		}
+	}
+	return answer
+}
+
 func AppendParamsIfNotPresent(existing, toAdd []tektonv1beta1.ParamSpec) []tektonv1beta1.ParamSpec {
 	for _, param := range toAdd {
 		if !containsParam(existing, param.Name) {
@@ -144,6 +160,16 @@ func containsParam(existing []tektonv1beta1.ParamSpec, name string) bool {
 		}
 	}
 	return false
+}
+
+func RemoveEnvs(existing, toRemove []v1.EnvVar) []v1.EnvVar {
+	var answer []v1.EnvVar
+	for _, env := range existing {
+		if !containsEnv(toRemove, env.Name) {
+			answer = append(answer, env)
+		}
+	}
+	return answer
 }
 
 func AppendEnvsIfNotPresent(existing, toAdd []v1.EnvVar) []v1.EnvVar {
@@ -172,6 +198,16 @@ func containsEnv(existing []v1.EnvVar, name string) bool {
 		}
 	}
 	return false
+}
+
+func RemoveEnvsFrom(existing, toRemove []v1.EnvFromSource) []v1.EnvFromSource {
+	var answer []v1.EnvFromSource
+	for _, envFrom := range existing {
+		if !containsEnvFrom(toRemove, envFrom.Prefix) {
+			answer = append(answer, envFrom)
+		}
+	}
+	return answer
 }
 
 func AppendEnvsFromIfNotPresent(existing, toAdd []v1.EnvFromSource) []v1.EnvFromSource {

@@ -1,6 +1,7 @@
 package processor_test
 
 import (
+	"github.com/jenkins-x/jx-helpers/v3/pkg/scmhelpers"
 	"testing"
 
 	"github.com/jenkins-x-plugins/jx-pipeline/pkg/pipelines/processor"
@@ -27,10 +28,10 @@ func TestNewRefFromUsesImage(t *testing.T) {
 		},
 		{
 			name:  "StandardJXPath",
-			image: "uses:jenkins-x/jx3-pipeline-catalog/tasks/go/pullrequest.yaml@versionStream",
+			image: "uses:jenkins-x/jx3-pipeline-catalog/tasks/go/pullrequest.yaml@master",
 			expected: &processor.GitRef{
 				URL:        "https://github.com/jenkins-x/jx3-pipeline-catalog.git",
-				Revision:   "versionStream",
+				Revision:   "master",
 				Org:        "jenkins-x",
 				Repository: "jx3-pipeline-catalog",
 				PathInRepo: "tasks/go/pullrequest.yaml",
@@ -79,7 +80,12 @@ func TestNewRefFromUsesImage(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			gitResolver := processor.NewGitRefResolver(tc.reversionOverride)
+			scmClient, _, err := scmhelpers.NewScmClient("", "", "", false)
+			if err != nil {
+				panic(err)
+			}
+
+			gitResolver := processor.NewGitRefResolver(scmClient, tc.reversionOverride)
 			actual, err := gitResolver.NewRefFromUsesImage(tc.image, tc.stepName)
 			assert.NoError(t, err)
 			assert.Equal(t, tc.expected, actual)
